@@ -1,7 +1,6 @@
 shader_type spatial;
 render_mode blend_mix, depth_draw_always, cull_disabled;
 
-
 // --- uniforms généraux
 uniform float height_scale   = 0.5;
 uniform float noise_scale    = 1.0;
@@ -32,7 +31,7 @@ uniform float foam_time_speed  = 0.2;
 uniform float foam_range       = 0.3;
 uniform float wave2_strength = 0.7;
 
-uniform vec4  islands[32];
+uniform vec4  islands[8];
 uniform int   island_count   = 2;
 uniform float calm_water_height = 0.5;
 
@@ -49,9 +48,17 @@ uniform float shore_foam_noise_mix = 0.5;
 
 uniform vec2 player_xz;
 
-const float COS_0   =  1.0;       const float SIN_0   =  0.0;
-const float COS_120 = -0.5;       const float SIN_120 =  0.8660254;
-const float COS_240 = -0.5;       const float SIN_240 = -0.8660254;
+// --- fade des bords du plane
+uniform bool edge_fade_enable = true;
+uniform float edge_fade_size : hint_range(0.0, 0.5, 0.001) = 0.15;
+uniform float edge_fade_smoothness : hint_range(0.001, 0.5, 0.001) = 0.10;
+
+const float COS_0   =  1.0;
+const float SIN_0   =  0.0;
+const float COS_120 = -0.5;
+const float SIN_120 =  0.8660254;
+const float COS_240 = -0.5;
+const float SIN_240 = -0.8660254;
 
 // ── VALUE NOISE ── pour les vagues
 float hash(vec2 p) {
@@ -96,15 +103,15 @@ float snoise(vec2 p) {
 
 float get_calm_factor(vec2 pos) {
     float calm = 1.0;
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 8; i++) {
         if (i >= island_count) break;
         vec2  island_pos = islands[i].xy;
         float calm_r     = islands[i].z;
         float shore_r    = islands[i].w;
         float dist = length(pos - island_pos);
-        calm = min(calm, smoothstep(shore_r, calm_r, dist));
+        calm = min(calm, smoothstep(shore_r, calm_r, dist)) + 0.2;
     }
-    return calm;
+    return clamp(calm, 0.0, 1.0);
 }
 
 float fbm(vec2 x) {
@@ -116,7 +123,6 @@ float fbm(vec2 x) {
         amp  *= 0.5;
         freq *= 2.0;
     }
-	
     return h;
 }
 
@@ -149,7 +155,7 @@ float sin_waves(vec2 world_xz) {
 void vertex() {
     vec3 orig      = VERTEX;
     vec3 world_pos = (MODEL_MATRIX * vec4(orig, 1.0)).xyz;
-    vec2 world_xz  = world_pos.xz;
+    vec2 world_xz  = world_pos.xz - player_xz;
     vec2 world_xz_abs = world_pos.xz;
 
     float h = 0.0;
@@ -163,20 +169,8 @@ void vertex() {
         h = sin_waves(world_xz);
         wave_fields = vec4(0.0);
     }
-	float eps = 0.05;
 
-	float hx1 = fbm_smooth_dir(world_xz + vec2(eps,0.0), COS_0,   SIN_0,   vec2( 0.8,  0.3));
-	float hx2 = fbm_smooth_dir(world_xz + vec2(eps,0.0), COS_120, SIN_120, vec2(-0.8,  0.3)) * wave2_strength;
-	float hx3 = fbm_smooth_dir(world_xz + vec2(eps,0.0), COS_240, SIN_240, vec2( 0.8, -0.3)) * wave2_strength;
-	float hx  = (hx1 + hx2 + hx3) * 0.3333;
-
-	float hz1 = fbm_smooth_dir(world_xz + vec2(0.0,eps), COS_0,   SIN_0,   vec2( 0.8,  0.3));
-	float hz2 = fbm_smooth_dir(world_xz + vec2(0.0,eps), COS_120, SIN_120, vec2(-0.8,  0.3)) * wave2_strength;
-	float hz3 = fbm_smooth_dir(world_xz + vec2(0.0,eps), COS_240, SIN_240, vec2( 0.8, -0.3)) * wave2_strength;
-	float hz  = (hz1 + hz2 + hz3) * 0.3333;
-	
-	NORMAL = normalize(vec3(h - hx, eps, h - hz));
-    float calm = get_calm_factor(world_xz);
+    float calm = get_calm_factor(world_xz_abs);
     v_calm      = calm;
     VERTEX.y    = mix(calm_water_height, orig.y + h * height_scale, calm);
     v_world_pos = vec3(world_pos.x, VERTEX.y, world_pos.z);
@@ -185,14 +179,18 @@ void vertex() {
 
 void fragment() {
     float fresnel = pow(1.0 - max(dot(NORMAL, VIEW), 0.0), 3.0);
-    ROUGHNESS = clamp(mix(0.3, 1.0, 1.0 - fresnel) + 0.2, 0.0, 1.0);
-	SPECULAR  = fresnel * 0.5;
+    SPECULAR  = fresnel * 0.8;
+    ROUGHNESS = mix(0.05, 1.0, 1.0 - fresnel) + 0.8;
 
     vec2  world_xz    = world_data.rg;
     float displaced_y = world_data.a;
     float calm        = v_calm;
 
-
+    vec3 dx      = dFdx(v_world_pos);
+    vec3 dz      = dFdy(v_world_pos);
+    vec3 n_world = normalize(cross(dz, dx));
+    if (!FRONT_FACING) n_world = -n_world;
+    NORMAL = normalize((mat3(VIEW_MATRIX) * n_world));
 
     // ---- mousse de crêtes (Simplex) ----
     float foam_factor = smoothstep(cap_height, cap_height + foam_range, displaced_y);
@@ -239,5 +237,14 @@ void fragment() {
 
     ALBEDO   = mix(depth_color, foam_col, combined_foam);
     EMISSION = mix(vec3(0.0), foam_col * 0.04, combined_foam);
-    ALPHA    = 0.98;
+
+    // --- fade bords du plane ---
+      // --- fade bords du plane ---
+    float edge_mask = 1.0;
+    if (edge_fade_enable) {
+        float edge_dist = 1.0 - UV.x;
+        edge_mask = smoothstep(edge_fade_size, edge_fade_size + edge_fade_smoothness, edge_dist);
+    }
+
+    ALPHA = 0.98 * edge_mask;
 }
