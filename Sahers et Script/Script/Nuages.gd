@@ -1,5 +1,6 @@
 extends Node3D
 @export var player: CharacterBody3D
+
 func _process(_delta: float) -> void:
 	if not player:
 		return
